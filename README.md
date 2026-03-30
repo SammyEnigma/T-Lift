@@ -1,416 +1,737 @@
-# T-Lift: Simplifying T-SQL Optimization
+# T-Lift
 
-### ⚠️ Early Development Notice ⚠️ 
+A T-SQL precompiler that transforms stored procedures into dynamic T-SQL — so SQL Server can build better query plans without you having to write dynamic SQL by hand.
 
-**Please Note:** This project is in its early stages of development. While it's functional and can be used, it has not undergone comprehensive testing. We encourage you to try it out but be aware that:
-- Some features may be incomplete or subject to change
-- Bugs or unexpected behavior may occur
-- Full stability is not yet guaranteed
+Written entirely in T-SQL. Ships as a single stored procedure (`sp_tlift`).
 
-We welcome your feedback and contributions to help improve the project!
+---
 
-[Project Description - Short Pitch](#project-description)
+## Table of Contents
 
-[An Introduction](#an-introduction)
+- [The Problem](#the-problem)
+- [What T-Lift Does](#what-t-lift-does)
+- [Installation](#installation)
+- [Basic Usage](#basic-usage)
+- [Quick Start](#quick-start)
+- [Directive Reference](#directive-reference)
+  - [Dynamic SQL Sections](#dynamic-sql-sections)
+  - [Single-Line Conditionals](#single-line-conditionals)
+  - [Remove Lines](#remove-lines)
+  - [Block Conditionals](#block-conditionals)
+  - [Else and Else-If](#else-and-else-if)
+  - [Comment-Out Lines](#comment-out-lines)
+  - [Named Sections](#named-sections)
+  - [Recompile Hint](#recompile-hint)
+  - [Named Conditions](#named-conditions)
+  - [Block Removal](#block-removal)
+  - [Buckets (Plan Cache Segmentation)](#buckets-plan-cache-segmentation)
+- [Variables vs. Parameters](#variables-vs-parameters)
+- [Wrapper Procedures](#wrapper-procedures)
+- [Validation Mode](#validation-mode)
+- [Parameters](#parameters)
+- [Compatibility](#compatibility)
+- [Roadmap](#roadmap)
+- [Version Log](#version-log)
 
-[Examples & Basic Syntax](#examples--basic-syntax)
+---
 
-[Installation](#installation)
+## The Problem
 
-[Basic Usage](#basic-usage)
-
-[Using Variables instead of Parameters](#using-variables-instead-of-parameters)
-
-[Roadmap](#roadmap)
-
-[Version log](#version-log)
-
-
-### Project Description
-
-T-Lift is a precompiler (written in T-SQL) that allows T-SQL developers to easily leverage dynamic T-SQL to create highly optimized query plans without the hassle of writing complex code. Traditional methods of using dynamic T-SQL often involve tedious coding practices that disrupt the development flow in SSMS. T-Lift simplifies this by automatically generating efficient T-SQL from your existing stored procedures, guided by simple directives embedded in T-SQL comments.
-
-With T-Lift, developers can maintain their familiar workflow in SSMS or their favorite editor while benefiting from powerful, dynamic query optimization. 
-
-Too good to be true? Read on. 😉
-
-### An Introduction
+Consider this common pattern in SQL Server stored procedures:
 
 ```sql
-USE [AdventureWorks2016_EXT]
+CREATE OR ALTER PROCEDURE dbo.SearchOrders
+    @CustomerID INT = NULL,
+    @Status NVARCHAR(20) = NULL
+AS
+SELECT o.OrderID, o.CustomerID, o.OrderDate, o.Status, o.TotalAmount
+FROM dbo.Orders o
+WHERE (@CustomerID IS NULL OR o.CustomerID = @CustomerID)
+  AND (@Status IS NULL OR o.Status = @Status)
+```
+
+This is a classic "catch-all" or "one-size-fits-all" query. It works correctly, but the SQL Server query optimizer cannot produce an optimal plan for it. The optimizer must account for every possible NULL/non-NULL combination at once, which typically means a full scan regardless of which parameters you actually supply.
+
+Worse, the execution plan that gets cached depends on whichever parameter values happened to come in first. Call it with `@CustomerID = 42` and SQL Server might cache a plan with an index seek. Call it next with no parameters — and that seek-based plan is reused for a full table scan scenario. The logical reads can differ by orders of magnitude for the same result set, depending purely on compilation order.
+
+This is parameter sniffing at work. It is not a bug — it is how SQL Server caching works. But it means that this common coding pattern quietly produces unpredictable performance in production.
+
+There is no index that fixes this structurally. The issue is in how the query is written.
+
+### The Known Solution: Dynamic SQL
+
+The SQL Server community has long recommended dynamic SQL via `sp_executesql` for this kind of scenario. By building only the predicates that actually apply at runtime, you let the optimizer see a simpler, more specific query — and it produces a better plan.
+
+But writing dynamic SQL by hand is tedious. You lose IntelliSense, syntax highlighting, and the ability to just highlight and execute a query in SSMS. The code is harder to read, harder to maintain, and harder to debug.
+
+That is the trade-off T-Lift tries to eliminate.
+
+---
+
+## What T-Lift Does
+
+T-Lift reads your existing stored procedure, looks for directives you place inside T-SQL comments, and generates a new version of that procedure using dynamic SQL and `sp_executesql`.
+
+Because the directives are just comments, your original procedure remains fully valid and executable. You can develop, test, and debug as usual in SSMS or any other editor. When you are ready, you run T-Lift to produce the optimized version.
+
+The basic idea: you annotate your procedure, T-Lift renders it.
+
+---
+
+## Installation
+
+1. Grab `sp_tlift.sql` from this repository.
+2. Execute it in a **separate** user database (not the database where your target procedures live).
+
+T-Lift reads metadata from other databases via `sys.sql_modules` and `sys.parameters`, so the executing user needs appropriate read permissions on the target database.
+
+```sql
+-- Example: install into a dedicated database
+USE [TLift_Engine];
 GO
 
-CREATE OR ALTER PROCEDURE tlift_demo_very_simple 
-@id INT = NULL
+-- Execute the sp_tlift.sql script
+-- (via SSMS "Open File" or sqlcmd -i sp_tlift.sql)
+```
+
+You can also ask T-Lift to explain itself:
+
+```sql
+EXEC dbo.sp_tlift @help = 1;
+```
+
+---
+
+## Testing
+
+The repository includes a small SQL Server regression harness under `intern_stuff/`.
+
+1. Run `intern_stuff/test_setup.sql` to create `TLift_Engine`, `TLift_TestDB`, and the sample data set.
+2. Execute `sp_tlift.sql` in `TLift_Engine`.
+3. Run `intern_stuff/test_procedures.sql` to create the annotated source procedures.
+4. Run `intern_stuff/run_tests.sql` to render, deploy, and execute the full suite.
+5. Inspect `TLift_TestDB.dbo.TestResults` for persisted pass/fail results.
+
+The demo script in `demos/` assumes the same split: `TLift_Engine` hosts `sp_tlift`, and `TLift_TestDB` hosts the procedures being rendered.
+
+---
+
+## Basic Usage
+
+```sql
+DECLARE @dynsql NVARCHAR(MAX);
+
+EXEC dbo.sp_tlift
+    @DatabaseName   = 'YourDatabase',
+    @ProcedureName  = 'YourProcedure',
+    @Result         = @dynsql OUTPUT;
+
+PRINT @dynsql;
+```
+
+T-Lift reads the source procedure, processes directives, and returns the rendered dynamic SQL procedure as a string in `@Result`. From there you can review it, adjust it, and deploy it.
+
+---
+
+## Quick Start
+
+Here is a complete end-to-end walkthrough. We start with a catch-all query, annotate it with T-Lift directives, and render it.
+
+### 1. Create the source procedure
+
+This is a standard catch-all query — it works correctly but suffers from parameter sniffing:
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.SearchOrders
+    @CustomerID INT = NULL,
+    @Status NVARCHAR(20) = NULL
 AS
-SELECT *
-FROM sales.SalesOrderDetail sod 
-WHERE (@id IS NULL or @id = sod.ProductID )
-GO
+                                        --#[
+SELECT o.OrderID, o.CustomerID, o.OrderDate, o.Status, o.TotalAmount
+FROM dbo.Orders o
+WHERE                                   --#if @CustomerID IS NOT NULL OR @Status IS NOT NULL
+(                                       --#-
+@CustomerID IS NULL OR                  --#-
+o.CustomerID = @CustomerID              --#if @CustomerID IS NOT NULL
+)                                       --#-
+AND                                     --#if @CustomerID IS NOT NULL AND @Status IS NOT NULL
+(                                       --#-
+@Status IS NULL OR                      --#-
+o.Status = @Status                      --#if @Status IS NOT NULL
+)                                       --#-
+                                        --#]
 ```
 
-This is a classic (straightforward) example of a multipurpose (aka one-size-fits-all) query. 
-And it will work, of course. But, unfortunately the SQL Server query optimizer cannot create an optimal plan. 
-What's more, the plan that's created and cached is heavily reliant on the 'first' execution, 
-precisely the parameter value, adding an element of unpredictability to the process. 
+Note: The procedure is still fully valid T-SQL. The `--#` directives are just comments — you can execute this procedure as-is in SSMS.
 
-To learn more about this, search for "sqlserver parameter sniffing". 
-However, it's important to remember that the core functionality is a valuable feature, not necessarily an issue. This reassurance should instill confidence in the system's capabilities. 
-
-Now, let's delve into a few examples of this issue to pique your interest and deepen your understanding. 
-
-Since, we have no idea what kind of "monitoring" you are familar with, we use this friendly setting here for your session. 
+### 2. Render it with T-Lift
 
 ```sql
-SET STATISTICS IO ON; 
+DECLARE @dynsql NVARCHAR(MAX);
 
-EXEC tlift_demo_very_simple @id= 897;
+EXEC dbo.sp_tlift
+    @DatabaseName   = 'YourDatabase',
+    @ProcedureName  = 'SearchOrders',
+    @Result         = @dynsql OUTPUT;
+
+PRINT @dynsql;
 ```
 
-Now, you should see two rows. But what matters most is on the **messages tab** of your SSMS.
+### 3. Review the output
 
-We are interested in this here: Table 'SalesOrderDetail'. Scan count 1, **logical reads 596**...
-
-Maybe you are aware that SQL Server is most the time thinking in 8kb pages and a single logical read means that the SQL Server uses one of these 8kb pages. From your storage, your memory, it dosent matter. 
-
-So, this tiny query from above needs 596 of these 8kb pages. Now, we have a single metric that is independent of your machine's age, size, and color. 
-
-*We can compare.* 
-
-Let's execute our procedure again but without a parameter. It will work because our query checks for NULL. 
+T-Lift produces a new procedure that builds only the applicable predicates at runtime:
 
 ```sql
-EXEC tlift_demo_very_simple;
-```
-
-Wow, we now have 121317 rows. Take a look at the messages tab again: Table 'SalesOrderDetail'. Scan count 1, **logical reads 371722**...
-
-Okay, but this number is so high because there are so many rows in the result set, right? (*Imagine the Princess Padmé Amidala Meme here*)
-
-Let's try it again, but we change the order of executions. 
-
-First marked our procedure for recompilation: 
-```sql
-EXEC sp_recompile 'tlift_demo_very_simple';
-```
-
-Now we start with this one friend here: 
-```sql
-EXEC tlift_demo_very_simple;
-```
-
-Do you remember the logical reads from last time? 371722! Now, take a look at the messages tab.
-
-WTH?! "Table 'SalesOrderDetail'. Scan count 1, **logical reads 596**..."
-
-And yes, it's the exact same result set. Please take your time and compare it row by row. We'll wait here. 
-
-The root cause of this seemingly insane result is not the SQL Server itself, but rather the lack of understanding among many developers about the inner workings of the Query Optimizer and the Execution Engine. 
-
-Since we are now on the same page, let's do it better.
-
-Now, let's address the elephant in the room: Is there a magical 'golden index' that can be defined to optimize this seemingly nonsensical result? The answer is a resounding No. 
-
-T-SQL is much harder to conquer than many developers are aware of. Sad news. 
-
-What is now a possible answer? **Dynamic T-SQL**!
-
-With dynamic T-SQL, you gain the power to control which parts of your query are visible to the query optimizer, leading to better query optimization. 
-
-Is this only our crazy idea? No, most of the *elders-of-the-sql-server-engine* (TM)... come up with this advice. 
-
-However, utilizing dynamic T-SQL in T-SQL stored procedures can be brutal. And it's quite a hell to test. All the cozy comfort of our beloved SSMS will be gone (is that the reason why we all have at least two instances of the SSMS open in case one of them leaves us?). 
-
-Now, let's turn our attention to T-Lift. What's this new tool all about? 
-
-As we wrote above, T-Lift is a T-SQL precompiler to translate a stored procedure into a dynamic T-SQL procedure. 
-
-The basic idea of T-Lift is to use dynamic T-SQL to render dynamic T-SQL. *Please, don't panic, breathe!*
-
-T-Lift will generate (we call this render) a new version of your existing procedure, but now with dynamic T-SQL parts included.
-
-And how can you control this? With directives hidden in T-SQL comments. This feature empowers you to develop as usual or even take already finished procedures and prepare them for T-Lift, giving you a sense of control and confidence. 
-
-Don't tell, show... okay. 
-
-### Examples & Basic Syntax
-
-```sql
-CREATE OR ALTER PROCEDURE tlift_demo_very_simple 
-@id int = null
+CREATE PROCEDURE dbo.tlift_version_of_your_sproc
+    @CustomerID INT = NULL,
+    @Status NVARCHAR(20) = NULL
 AS
-						--#[
-SELECT *
-FROM sales.SalesOrderDetail sod 
-WHERE							--#if @id IS NOT NULL 
-(							--#-
-@id IS NULL or						--#-
-@id = sod.ProductID					--#if @id IS NOT NULL
-)							--#-
-						--#]
+DECLARE @sql NVARCHAR(MAX) = N''
+SET @sql = @sql + 'SELECT o.OrderID, o.CustomerID, o.OrderDate, o.Status, o.TotalAmount' + CHAR(13)+CHAR(10)
+SET @sql = @sql + 'FROM dbo.Orders o' + CHAR(13)+CHAR(10)
+IF @CustomerID IS NOT NULL OR @Status IS NOT NULL
+    SET @sql = @sql + 'WHERE' + CHAR(13)+CHAR(10)
+IF @CustomerID IS NOT NULL
+    SET @sql = @sql + 'o.CustomerID = @CustomerID' + CHAR(13)+CHAR(10)
+IF @CustomerID IS NOT NULL AND @Status IS NOT NULL
+    SET @sql = @sql + 'AND' + CHAR(13)+CHAR(10)
+IF @Status IS NOT NULL
+    SET @sql = @sql + 'o.Status = @Status' + CHAR(13)+CHAR(10)
+EXEC sp_executesql @sql, N'@CustomerID int, @Status nvarchar(20)', @CustomerID, @Status
 ```
 
-It's the same query as above, but now we have added some line breaks AND comments. 
+Now each combination of parameters gets its own optimized plan. Call it with `@CustomerID = 42` — only the `CustomerID` predicate is included. Call it with no parameters — no WHERE clause at all.
 
-Open and close a **dynamic T-SQL section** in our T-SQL code:
-```sql
---#[ // Open
+### 4. Deploy
 
---#] // Close
+Review the rendered output, then execute it in your target database to create the optimized procedure. You can customize the output procedure name with the `@ProcedureNameNew` parameter.
+
+---
+
+## Directive Reference
+
+All directives live inside T-SQL line comments (`--#...`), so they do not affect the original procedure in any way.
+
+### Dynamic SQL Sections
+
+Mark which parts of your procedure should become dynamic SQL.
+
+```
+--#[              Open a dynamic SQL section
+--#]              Close a dynamic SQL section
 ```
 
-That's our query. Why did we add these brackets? Because not all codes of your procedure need to be handled as dynamic T-SQL. You decide. 
-
-We have different types of possible condition directives:
-```sql
---#if <condition> // Single line of T-SQL code
-
---#{if <condition> // Opens a section that is bound to this condition
-
---#} // Close
-```
+Only code between `--#[` and `--#]` is rendered as dynamic SQL. Everything outside these brackets passes through unchanged. A single procedure can have multiple sections.
 
 ```sql
---#- // We don't need this line in a dynamic T-SQL scenario anymore. Get rid of it. 
-```
-
-Okay, but how does our procedure look after we did this precompiler thing? 
-
-```sql
-declare @dynsql nvarchar(max)
-exec dbo.sp_tlift 
-    @DatabaseName =  'AdventureWorks2016_EXT'
-    ,@ProcedureName ='tlift_demo_very_simple'
-    ,@result = @dynsql output 
-
-print @dynsql
-```
-
-```sql
-create   procedure tlift_version_of_your_sproc 
-@id int = null
+CREATE OR ALTER PROCEDURE dbo.SearchCustomers
+    @City NVARCHAR(50) = NULL
 AS
-declare @sql nvarchar(max) = N'' 
-set @sql = @sql + 'SELECT *'+CHAR(13)+CHAR(10)
-set @sql = @sql + 'FROM sales.SalesOrderDetail sod '+CHAR(13)+CHAR(10)
-if @id IS NOT NULL
-set @sql = @sql + 'WHERE						'+CHAR(13)+CHAR(10)
---(							
---@id IS NULL or				
-if @id IS NOT NULL
-set @sql = @sql + '@id = sod.ProductID			'+CHAR(13)+CHAR(10)
---)							
-exec sp_executesql @sql, N'@id int', @id 
+                                    --#[
+SELECT c.CustomerID, c.FirstName, c.LastName, c.City
+FROM dbo.Customers c
+WHERE                               --#if @City IS NOT NULL
+(                                   --#-
+@City IS NULL OR                    --#-
+c.City = @City                      --#if @City IS NOT NULL
+)                                   --#-
+                                    --#]
 ```
 
-Such a beauty, right? :)
+### Single-Line Conditionals
 
-Okay, if you or one of your co-workers has never worked with dynamic T-SQL, that is why. 
-
-But we need data. Let's rerun our tests. 
-
-
-```sql
-EXEC tlift_version_of_your_sproc @id= 897;
+```
+--#if <condition>
 ```
 
-And we got our two rows. But what's that? "Table 'SalesOrderDetail'. Scan count 1, **logical reads 10**"
-
-Let's do the second one: 
-
+Controls whether the **line it is placed on** is included in the rendered dynamic SQL. The condition is evaluated at runtime in the generated procedure.
 
 ```sql
-EXEC tlift_version_of_your_sproc;
+SELECT c.CustomerID, c.FirstName, c.LastName
+FROM dbo.Customers c
+WHERE                               --#if @CustomerID IS NOT NULL
+c.CustomerID = @CustomerID          --#if @CustomerID IS NOT NULL
 ```
 
-And that's awesome, right? Only "Table 'SalesOrderDetail.' Scan count 1, **logical reads 596**"
-
-Okay, but how can we do (a little) more complex stuff?
+When `@CustomerID IS NULL`, the rendered SQL simply becomes:
 
 ```sql
-create or alter procedure tlift_demo_very_simple3 
-@id int = null,
-@orderQty int = null
+SELECT c.CustomerID, c.FirstName, c.LastName
+FROM dbo.Customers c
+```
+
+No WHERE clause at all — and the optimizer knows it.
+
+### Remove Lines
+
+```
+--#-
+```
+
+Marks a line to be removed entirely in the dynamic version. Use this for the static fallback logic (`@param IS NULL OR ...`) that you need in the original procedure but not in the dynamic one.
+
+```sql
+WHERE                               --#if @City IS NOT NULL
+(                                   --#-
+@City IS NULL OR                    --#-
+c.City = @City                      --#if @City IS NOT NULL
+)                                   --#-
+```
+
+The lines marked `--#-` are the "glue" that makes the original procedure work without dynamic SQL. T-Lift strips them out because the `--#if` conditions already handle the logic.
+
+### Block Conditionals
+
+For multi-line blocks that should all be governed by one condition:
+
+```
+--#{if <condition>      Open a conditional block
+--#}                    Close it
+```
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.OrderReport
+    @CustomerID INT = NULL,
+    @IncludeDetails BIT = 0
 AS
-						--#[ simple3
-SELECT *
-FROM sales.SalesOrderDetail sod 
-WHERE							--#if @id IS NOT NULL OR @orderQty IS NOT NULL
-(							--#-
-@id IS NULL or						--#-
-@id = sod.ProductID					--#if @id IS NOT NULL
-)							--#-
-and							--#if @id IS NOT NULL AND @orderQty IS NOT NULL
-(@orderQty IS NULL OR					--#-
-sod.OrderQty >= @orderQty				--#if @orderQty IS NOT NULL
-)							--#-
-						--#]
+                                    --#[ OrderSummary
+SELECT o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount
+FROM dbo.Orders o
+WHERE                               --#if @CustomerID IS NOT NULL
+o.CustomerID = @CustomerID          --#if @CustomerID IS NOT NULL
+                                    --#]
+
+                                    --#{if @IncludeDetails = 1
+                                    --#[ OrderDetails
+SELECT oi.OrderItemID, oi.OrderID, oi.ProductID, oi.Quantity, oi.LineTotal
+FROM dbo.OrderItems oi
+INNER JOIN dbo.Orders o ON oi.OrderID = o.OrderID
+WHERE                               --#if @CustomerID IS NOT NULL
+o.CustomerID = @CustomerID          --#if @CustomerID IS NOT NULL
+                                    --#]
+                                    --#}
 ```
 
-Got the vibes? The only new thing here is after the "--#[" the "simple 3" because we want to show you how to identify such queries in the plan cache. 
+When `@IncludeDetails = 0`, the entire detail query — including its dynamic SQL section — is skipped.
 
-Some more or less random tests: 
+#### Block Conditionals Inside Dynamic SQL Sections
+
+`--#{if` blocks can also be used **inside** a `--#[` section to conditionally include groups of lines — such as an optional WHERE clause — with the condition stated only once. This is the cleanest way to handle a single optional filter:
+
 ```sql
-exec tlift_version_of_your_sproc3 @id= 897
-exec tlift_version_of_your_sproc3 @id = 866
-exec tlift_version_of_your_sproc3
-exec tlift_version_of_your_sproc3 @orderQty = 4
-exec tlift_version_of_your_sproc3 @orderQty = 4, @id = 866
+CREATE OR ALTER PROCEDURE dbo.SearchByCustomer
+    @CustomerID INT = NULL
+AS
+                                    --#[ Search
+SELECT c.CustomerID, c.FirstName, c.LastName, c.City
+FROM dbo.Customers c
+                                    --#{if @CustomerID IS NOT NULL
+WHERE
+c.CustomerID = @CustomerID
+                                    --#}
+                                    --#]
+```
+
+When `@CustomerID` is NULL, the rendered SQL has no WHERE clause at all. When non-NULL, it includes `WHERE c.CustomerID = @CustomerID`. The condition appears once on the `--#{if` line instead of being repeated on every line.
+
+You can still combine `--#{if` with `--#-` for catch-all static SQL patterns:
+
+```sql
+                                    --#{if @CustomerID IS NOT NULL
+WHERE
+(                                   --#-
+@CustomerID IS NULL OR              --#-
+c.CustomerID = @CustomerID
+)                                   --#-
+                                    --#}
+```
+
+### Else and Else-If
+
+Inside a block conditional, you can add alternative branches:
+
+```
+--#else                  Else branch
+--#{elseif <condition>   Else-if branch with a new condition
 ```
 
 ```sql
-SELECT cplan.usecounts, cplan.objtype, qtext.text, qplan.query_plan
+CREATE OR ALTER PROCEDURE dbo.CustomerList
+    @SortMode INT = 0
+AS
+                                    --#[ CustList
+SELECT c.CustomerID, c.FirstName, c.LastName, c.City
+FROM dbo.Customers c
+                                    --#]
+
+                                    --#{if @SortMode = 1
+PRINT 'Sorting by name'
+                                    --#{elseif @SortMode = 2
+PRINT 'Sorting by city'
+                                    --#else
+PRINT 'Default sort order'
+                                    --#}
+```
+
+This renders as a standard `IF / ELSE IF / ELSE` chain in the output.
+
+### Comment-Out Lines
+
+```
+--#c
+```
+
+Keeps the line in the rendered output, but comments it out (prefixed with `--`). Useful for keeping reference information visible without executing it.
+
+```sql
+ORDER BY o.OrderDate DESC           --#c
+```
+
+In the rendered output, this becomes:
+
+```sql
+--ORDER BY o.OrderDate DESC
+```
+
+### Named Sections
+
+You can give a dynamic SQL section a label by placing text after `--#[`. The label is embedded as a SQL comment (`/*label*/`) in the rendered `sp_executesql` call, making it easy to find specific queries in the plan cache.
+
+```sql
+                                    --#[ CustomerSearch
+SELECT c.CustomerID, c.FirstName, c.LastName
+FROM dbo.Customers c
+WHERE                               --#if @City IS NOT NULL
+c.City = @City                      --#if @City IS NOT NULL
+                                    --#]
+```
+
+You can then find cached plans for this section:
+
+```sql
+SELECT cplan.usecounts, qtext.text, qplan.query_plan
 FROM sys.dm_exec_cached_plans AS cplan
 CROSS APPLY sys.dm_exec_sql_text(plan_handle) AS qtext
 CROSS APPLY sys.dm_exec_query_plan(plan_handle) AS qplan
-WHERE qtext.text LIKE '%/*simple3*/%' AND qtext.text NOT LIKE '%SELECT cplan.usecounts%'
+WHERE qtext.text LIKE '%/*CustomerSearch*/%'
+  AND qtext.text NOT LIKE '%dm_exec_cached_plans%'
 ORDER BY cplan.usecounts DESC;
 ```
 
-Here, you can witness how these executions are fulfilled: 
+### Named Conditions
 
-```sql
-(@id int, @orderQty int)/*simple3*/SELECT *  FROM sales.SalesOrderDetail sod   WHERE        @id = sod.ProductID     
-(@id int, @orderQty int)/*simple3*/SELECT *  FROM sales.SalesOrderDetail sod   WHERE        @id = sod.ProductID     and         sod.OrderQty >= @orderQty   
-(@id int, @orderQty int)/*simple3*/SELECT *  FROM sales.SalesOrderDetail sod   WHERE        sod.OrderQty >= @orderQty   
-(@id int, @orderQty int)/*simple3*/SELECT *  FROM sales.SalesOrderDetail sod   
+```
+--#define <name> = <condition>
 ```
 
-Ah, your question is, what does the new procedure look like?
+Defines a reusable condition that can be referenced by name in `--#if`, `--#{if`, and `--#{elseif` directives. This eliminates repetition when the same condition appears in multiple places.
+
+The `--#define` directive emits no output — it is metadata only. Place it before any `--#[` section that uses it.
 
 ```sql
- create or alter  procedure tlift_version_of_your_sproc3 
-@id int = null,
-@orderQty int = null
+CREATE OR ALTER PROCEDURE dbo.OrderReport
+    @CustomerID INT = NULL,
+    @IncludeDetails BIT = 0
 AS
-declare @sql nvarchar(max) = N'' 
-set @sql = @sql + 'SELECT *'+CHAR(13)+CHAR(10)
-set @sql = @sql + 'FROM sales.SalesOrderDetail sod '+CHAR(13)+CHAR(10)
-if @id IS NOT NULL OR @orderQty IS NOT NULL
-set @sql = @sql + 'WHERE						'+CHAR(13)+CHAR(10)
---(							
---@id IS NULL or				
-if @id IS NOT NULL
-set @sql = @sql + '@id = sod.ProductID			'+CHAR(13)+CHAR(10)
---)							
-if @id IS NOT NULL AND @orderQty IS NOT NULL
-set @sql = @sql + 'and							'+CHAR(13)+CHAR(10)
---(@orderQty IS NULL OR		
-if @orderQty IS NOT NULL
-set @sql = @sql + 'sod.OrderQty >= @orderQty	'+CHAR(13)+CHAR(10)
---)							
-set @sql = '/*simple3*/' + @sql
-exec sp_executesql @sql, N'@id int, @orderQty int', @id , @orderQty 
+                                    --#define custFilter = @CustomerID IS NOT NULL
+
+                                    --#[ OrderSummary
+SELECT o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount
+FROM dbo.Orders o
+                                    --#{if custFilter
+WHERE
+o.CustomerID = @CustomerID
+                                    --#}
+                                    --#]
+
+                                    --#{if @IncludeDetails = 1
+                                    --#[ OrderDetails
+SELECT oi.OrderItemID, oi.OrderID, oi.ProductID, oi.Quantity, oi.LineTotal
+FROM dbo.OrderItems oi
+INNER JOIN dbo.Orders o ON oi.OrderID = o.OrderID
+                                    --#{if custFilter
+WHERE
+o.CustomerID = @CustomerID
+                                    --#}
+                                    --#]
+                                    --#}
 ```
 
-As we said, dynamic T-SQL is no joke.
+Without `--#define`, the condition `@CustomerID IS NOT NULL` would appear on every `--#if` / `--#{if` line — in this example, that is 4 repetitions. With a named condition, it is defined once and referenced by name.
 
-So, it's your turn, give it a try. ;)
+Rules:
+- Names must **not** start with `@` (to avoid confusion with parameters).
+- Names are case-insensitive.
+- A `--#define` must appear **before** any directive that references it (top-to-bottom processing).
+- T-Lift warns if a defined condition is never used.
 
-Please use GitHub's precious feedback system.
+### Block Removal
 
-### Installation
-Here's how to get started: grab the code from the main branch and run it in a separate user database of your choice. It's important to note that this should not be the same user database where you have your procedures you want T-Lift to use on. We've spent a lot of time on the feature to ensure it can gather all necessary metadata from other databases. ;)
-
-### Basic Usage
-As we showed in the introduction but with more parameters:
-```sql
-declare @dynsql nvarchar(max)
-exec dbo.sp_tlift 
-    @DatabaseName =  'AdventureWorks2016_EXT'
-    ,@SchemaName = 'dbo' -- default schema
-    ,@ProcedureName = 'tlift_demo_very_simple'
-    ,@ProcedureNameNew = = 'tlift_version_of_your_sproc' -- default name
-    ,@result = @dynsql output 
-
-print @dynsql
+```
+--#{-             Open a removal block
+--#-}             Close a removal block
 ```
 
-You also can ask for help. 
+All lines between `--#{-` and `--#-}` are treated as removed (like `--#-`), without needing per-line annotations. This reduces noise when you have several consecutive scaffolding lines.
+
 ```sql
-exec dbo.sp_tlift @help=1
+                                    --#{if @CustomerID IS NOT NULL
+WHERE
+                                    --#{-
+(
+@CustomerID IS NULL OR
+                                    --#-}
+c.CustomerID = @CustomerID
+                                    --#{-
+)
+                                    --#-}
+                                    --#}
 ```
 
-### Using Variables instead of Parameters
-You may have noticed, but T-Lift has automatically recognised the parameters of the example procedure. Cool, right? SQL Server is still one of the most informative databases when it comes to metadata. 
+Block removal is most useful when you have 4+ consecutive lines that all need `--#-`. For fewer lines, individual `--#-` annotations may be simpler.
 
-But what about using variables instead of parameters in a statement in a procedure? 
+### Recompile Hint
 
-**First of all, if you are not aware of it, it is not the same thing!**
+```
+--#recompile
+```
 
-And yes, at first glance, T-SQL variables and parameters look identical. Both start with that funny @, have to be declared with a type, etc. 
-
-But when it comes to the use of variables by the Query Optimizer, things look really bleak, as it cannot see and evaluate them at all due to the way it works.
-
-However. T-Lift also helps here, because if you work with dynamic T-SQL, the Query Optimizer is also able to evaluate the passed variables when sp_executesql is called. 
-
-But, why we have to talk about variables hier in an extra section? The reason for this is that we unfortunately cannot access the variables used in a procedure as easily as we can access the parameters. And T-Lift does not (yet...) rely on a lexer and parser, so we have to help it a little by indicating the use of variables with two more directives. 
-
-First of all, when declaring a variable, we have to tell the precompiler that we want to use it later in a dynamic statement. To be clear, this is only necessary for variables that we want to use later in dynamic T-SQL; this does not apply to all others. 
+Place this directive anywhere inside a dynamic SQL section. T-Lift will append `OPTION(RECOMPILE)` to the `sp_executesql` call for that section. Use this when you want fresh plans on every execution — for example, when parameter distributions are highly skewed and even the dynamic SQL approach benefits from recompilation.
 
 ```sql
+                                    --#[ HeavyReport
+                                    --#recompile
+SELECT ...
+FROM ...
+WHERE ...                           --#if @DateFrom IS NOT NULL
+                                    --#]
+```
+
+### Buckets (Plan Cache Segmentation)
+
+```
+--#buckets @param: value1, value2, value3
+```
+
+Place this directive on its own line inside a `--#[` / `--#]` section. T-Lift generates CASE-based bucket variables that segment the plan cache based on parameter value ranges. Each range gets its own cached plan, which is useful when the optimal plan shape varies significantly depending on the parameter's magnitude.
+
+The values define the boundaries between buckets. For example, `--#buckets @Amount: 50, 100, 200` creates four buckets:
+
+| Bucket | Condition |
+|--------|-----------|
+| `00`   | `@Amount < 50` |
+| `01`   | `@Amount >= 50 AND @Amount < 100` |
+| `02`   | `@Amount >= 100 AND @Amount < 200` |
+| `03`   | `@Amount >= 200` |
+
+The bucket value is prepended as a SQL comment (`/*01*/`) to the dynamic SQL, so `sp_executesql` caches a separate plan for each bucket.
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.OrdersByAmount
+    @MinAmount DECIMAL(10,2) = NULL
+AS
+                                                --#[ OrdersByAmount
+                                                --#buckets @MinAmount: 50, 100, 200
+SELECT o.OrderID, o.CustomerID, o.TotalAmount
+FROM dbo.Orders o
+WHERE                                           --#if @MinAmount IS NOT NULL
+o.TotalAmount >= @MinAmount                     --#if @MinAmount IS NOT NULL
+                                                --#]
+```
+
+You can use multiple `--#buckets` directives in the same section for multi-dimensional segmentation.
+
+---
+
+## Variables vs. Parameters
+
+T-Lift automatically picks up procedure **parameters** from `sys.parameters` — no extra work needed. But T-SQL **variables** declared inside the procedure body are a different story: the optimizer cannot see their values, and T-Lift cannot read them from metadata.
+
+If you use local variables inside a dynamic SQL section, you need to tell T-Lift about them with two directives.
+
+### Step 1: Mark the Declaration
+
+```
 --#var
 ```
 
-Here are a few examples. As you will have noticed, we currently support a notation with and without initial value assignment. 
+Place this on the `DECLARE` line of any variable you want to pass into dynamic SQL.
+
 ```sql
-DECLARE @customer_name1 varchar(50); --#var
-DECLARE @product_price1 decimal(10,2); --#var
-DECLARE @order_date1 datetime2(3); --#var
-DECLARE @is_active1 bit; --#var
-DECLARE @large_text1 nvarchar(max); --#var
-DECLARE @small_number1 tinyint; --#var
-DECLARE @unique_id1 uniqueidentifier; --#var
-DECLARE @binary_data1 varbinary(100); --#var
-DECLARE @float_value1 float(24); --#var
-DECLARE @customer_name varchar(50) = 'John Doe'; --#var
-DECLARE @product_price decimal(10,2) = 99.99; --#var
-DECLARE @order_date datetime2(3) = GETDATE(); --#var
-DECLARE @is_active bit = 1; --#var
-DECLARE @large_text nvarchar(max) = N'This is a long text...'; --#var
-DECLARE @small_number tinyint = 255; --#var
-DECLARE @unique_id uniqueidentifier = NEWID(); --#var
-DECLARE @binary_data varbinary(100) = 0x1234567890; --#var
-DECLARE @float_value float(24) = 3.14159; --#var
-DECLARE @xml_data xml = '<root><element>Test</element></root>'; --#var
-DECLARE @json_data nvarchar(max) = N'{"key": "value"}'; --#var
-DECLARE @date_only date = '2023-09-17'; --#var
-DECLARE @time_only time(7) = '12:34:56.1234567'; --#var
-DECLARE @money_amount money = $1234.56; --#var
+DECLARE @ActiveOnly BIT = 1;               --#var
+DECLARE @MinPrice DECIMAL(10,2) = 9.99;    --#var
 ```
 
-However, it is important to note that we currently only support one variable per declaration and line. If your existing code looks different, you will unfortunately have to adjust it accordingly. 
-```sql
-/* Not supported, yet. */
-DECLARE @v1 INT = 1, @v2 INT = 2 --#var
+One variable per line. Multi-variable declarations on a single line are not supported:
 
-/* Supported. */
-DECLARE @v1 INT = 1 --#var
-DECLARE @v2 INT = 2 --#var
+```sql
+-- Not supported:
+DECLARE @v1 INT = 1, @v2 INT = 2   --#var
+
+-- Supported:
+DECLARE @v1 INT = 1                 --#var
+DECLARE @v2 INT = 2                 --#var
 ```
 
-Okay, that's the first half of the work to use variables. Now we need to specify within the dynamic T-SQL section (Do you remember those brackets with *--#[* and *--#]* ?) that you want to use this particular variable. We do that with this directive here: 
-```sql
---#usevar @variableName1, @variableName2
+T-Lift supports a wide range of data types — `INT`, `VARCHAR`, `DECIMAL`, `DATETIME2`, `UNIQUEIDENTIFIER`, `NVARCHAR(MAX)`, and many more.
+
+### Step 2: Register in the Dynamic Section
+
+```
+--#usevar @var1, @var2
 ```
 
-Here is a small example of more cohesive code. 
+Inside a `--#[` / `--#]` section, this tells T-Lift to include these variables in the `sp_executesql` parameter list. The directive can go on any line within the section.
+
 ```sql
-declare @v1 int = 897 --#var
---#[ Query 4
-select * --#usevar @v1
-from sales.SalesOrderDetail sod 
-where sod.ProductID = @v1 
---#]
+CREATE OR ALTER PROCEDURE dbo.ActiveProducts
+    @Category NVARCHAR(50) = NULL
+AS
+DECLARE @ActiveOnly BIT = 1;               --#var
+
+                                            --#[ ActiveProds
+SELECT p.ProductID, p.ProductName,          --#usevar @ActiveOnly
+       p.Category, p.UnitPrice
+FROM dbo.Products p
+WHERE                                       --#if @Category IS NOT NULL OR @ActiveOnly = 1
+p.Category = @Category                      --#if @Category IS NOT NULL
+AND                                         --#if @Category IS NOT NULL AND @ActiveOnly = 1
+p.IsActive = @ActiveOnly                    --#if @ActiveOnly = 1
+                                            --#]
 ```
-As you can see, the *--#usevar* directive does not have to be used exactly in the line of use. And, at least we've got this far, you can specify multiple variables separated by a comma. 
 
-### Return data using an output parameter
-https://learn.microsoft.com/en-us/sql/relational-databases/stored-procedures/return-data-from-a-stored-procedure?view=sql-server-ver16#return-data-using-an-output-parameter
+Now both the parameter `@Category` and the variable `@ActiveOnly` are passed to `sp_executesql`, and the optimizer can see both values at compile time.
 
-### Roadmap
-We have so many ideas... but first we need to add much more error checks. 
+---
 
-### Version log
-- 0.43 - First time public on GitHub
-- 0.46 - Replacement of sp_helptext (enough is enough...) & adding support for "output variables"
+## Wrapper Procedures
+
+For scenarios where you want separate plan cache entries per usage pattern — not just per query shape within dynamic SQL — T-Lift can generate **wrapper procedures**. A wrapper is a dispatcher that routes calls to specialized child procedures based on parameter conditions, giving each child its own cached plan.
+
+This is the approach that many SQL Server experts recommend for extreme parameter sniffing cases, but it is painful to maintain by hand. T-Lift generates the wrapper and all child procedures from a single annotated source.
+
+### Directives
+
+```
+--#wrapper                              Enable wrapper mode
+--#branch <suffix> <condition>          Define a conditional child branch
+--#branch-default <suffix>              Define the default fallback child
+```
+
+### Example
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.SearchCustomers
+    @CustomerID INT = NULL,
+    @City NVARCHAR(50) = NULL
+AS
+--#wrapper
+--#branch _byCust @CustomerID IS NOT NULL
+--#branch _byCity @City IS NOT NULL
+--#branch-default _all
+                                        --#[ CustSearch
+SELECT c.CustomerID, c.FirstName, c.LastName, c.Email, c.City
+FROM dbo.Customers c
+WHERE                                   --#if @CustomerID IS NOT NULL OR @City IS NOT NULL
+(                                       --#-
+@CustomerID IS NULL OR                  --#-
+c.CustomerID = @CustomerID              --#if @CustomerID IS NOT NULL
+)                                       --#-
+AND                                     --#if @CustomerID IS NOT NULL AND @City IS NOT NULL
+(                                       --#-
+@City IS NULL OR                        --#-
+c.City = @City                          --#if @City IS NOT NULL
+)                                       --#-
+                                        --#]
+```
+
+T-Lift produces:
+
+1. **A wrapper procedure** (`tlift_version_of_your_sproc`) that dispatches:
+   ```sql
+   IF @CustomerID IS NOT NULL
+       EXEC [dbo].[tlift_version_of_your_sproc_byCust] @CustomerID = @CustomerID, @City = @City;
+   ELSE IF @City IS NOT NULL
+       EXEC [dbo].[tlift_version_of_your_sproc_byCity] @CustomerID = @CustomerID, @City = @City;
+   ELSE
+       EXEC [dbo].[tlift_version_of_your_sproc_all] @CustomerID = @CustomerID, @City = @City;
+   ```
+
+2. **Child procedures** (`_byCust`, `_byCity`, `_all`), each a full copy of the rendered dynamic SQL procedure with its own name. Each child gets its own plan cache entry.
+
+---
+
+## Validation Mode
+
+Before rendering, you can validate your annotated procedure for common mistakes:
+
+```sql
+EXEC dbo.sp_tlift
+    @DatabaseName  = 'YourDatabase',
+    @ProcedureName = 'YourProcedure',
+    @validateOnly  = 1;
+```
+
+This checks for:
+
+- **Procedure existence** — does the target procedure actually exist?
+- **Unmatched brackets** — every `--#[` needs a `--#]`.
+- **Unknown directives** — catches typos like `--#fi` instead of `--#if`.
+- **Out-of-section conditionals** — `--#if` used outside a `--#[` / `--#]` block.
+- **Unmatched usevar references** — `--#usevar @x` without a corresponding `DECLARE @x ... --#var`.
+
+No output is produced — just error messages if anything is off.
+
+---
+
+## Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `@DatabaseName` | `NVARCHAR(128)` | — | Target database containing the source procedure. Required. |
+| `@SchemaName` | `NVARCHAR(128)` | `'dbo'` | Schema of the source procedure. |
+| `@ProcedureName` | `NVARCHAR(128)` | — | Name of the source procedure. Required. |
+| `@ProcedureNameNew` | `NVARCHAR(128)` | `'tlift_version_of_your_sproc'` | Name for the generated procedure. |
+| `@validateOnly` | `BIT` | `0` | Validate directives without rendering output. |
+| `@debugLevel` | `INT` | `0` | Controls debug output verbosity (0 = off). |
+| `@verboseMode` | `BIT` | `0` | Additional processing messages. |
+| `@includeOurComments` | `BIT` | `0` | Include T-Lift's own comments in the output. |
+| `@includeDebug` | `BIT` | `1` | Include debug-related markers in the output. |
+| `@help` | `BIT` | `0` | Print usage information and exit. |
+| `@Result` | `NVARCHAR(MAX) OUTPUT` | — | The rendered procedure as a string. |
+
+---
+
+## Compatibility
+
+- **Minimum SQL Server version:** SQL Server 2017 (uses `STRING_AGG`, `TRIM`).
+- On SQL Server 2022+, T-Lift uses `STRING_SPLIT` with the `enable_ordinal` option for guaranteed line ordering. On older versions, it falls back to an identity-based approach.
+- T-Lift runs as a standard stored procedure — no CLR, no external dependencies.
+
+---
+
+## Roadmap
+
+There is plenty left to do. Among other things:
+
+- Automatic deployment option (`@execute` parameter to directly create the generated procedure)
+- Support for custom directive prefixes (currently `#` is hard-coded)
+- Extended validation and better error messages
+- Nested dynamic SQL sections
+
+Feedback and contributions via GitHub issues are welcome.
+
+---
+
+## Version Log
+
+- **1.01** — Named conditions (`--#define`), block removal (`--#{-` / `--#-}`), `--#{if` blocks inside dynamic SQL sections (empty line guard fix), improved condition handling in `--#if` / `--#{if` / `--#{elseif` with named condition resolution, unused condition warnings, removal block bracket validation
+- **1.00** — Else / else-if directives (`--#else`, `--#{elseif`), validation mode (`@validateOnly`), wrapper procedure generation (`--#wrapper`, `--#branch`), recompile hint (`--#recompile`), comment-out directive (`--#c`), bucket-based plan cache segmentation (`--#buckets`), unknown directive detection, bracket matching validation, TRY/CATCH error handling, safe procedure rename, SQL 2022+ ordinal support
+- **0.46** — Replaced `sp_helptext` with `sys.sql_modules` for procedure text retrieval. Added support for output parameters.
+- **0.43** — First public release on GitHub
+
+---
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE) for details.

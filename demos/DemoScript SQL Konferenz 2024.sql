@@ -1,247 +1,180 @@
-USE [AdventureWorks2016_EXT]
+/*=====================================================================
+  T-Lift Demo Script — current install/execution model
 
-DBCC FREEPROCCACHE
+  Prerequisites:
+	1. Run intern_stuff/test_setup.sql to create TLift_Engine and TLift_TestDB.
+	2. Execute sp_tlift.sql in TLift_Engine.
+
+  This demo uses the same split as the README and internal tests:
+	- TLift_Engine hosts dbo.sp_tlift
+	- TLift_TestDB hosts the source and rendered procedures
+=====================================================================*/
+
+USE [TLift_TestDB];
 GO
 
-CREATE or ALTER Procedure [dbo].[tlift_demo_very_simple]
-@id int = NULL
-as
-select *
-from sales.SalesOrderDetail sod 
-where (@id is null or sod.ProductID = @id)
-order by sod.ProductID
+DROP PROCEDURE IF EXISTS dbo.tlift_demo_search_orders;
+DROP PROCEDURE IF EXISTS dbo.tlift_demo_search_orders_rendered;
 GO
 
--- Why can this be a tricky one? 
-SELECT sod.ProductID, COUNT(*) [Count]
-from sales.SalesOrderDetail sod 
-GROUP BY sod.ProductID
-ORDER BY 2 desc
-
-SET STATISTICS IO ON;
-EXEC [tlift_demo_very_simple] @id = 897		-- 2 rows
-EXEC [tlift_demo_very_simple]				-- 121.317 rows
-
--- Lets start over again. 
-EXEC sp_recompile 'tlift_demo_very_simple';
-
-EXEC [tlift_demo_very_simple]				-- 121.317 rows
-EXEC [tlift_demo_very_simple] @id = 897		-- 2 rows
-GO
-
-create OR alter  procedure [dbo].[tlift_demo_very_simple_dynamic_version]
-@id int = null
+CREATE OR ALTER PROCEDURE dbo.tlift_demo_search_orders
+	@CustomerID INT = NULL,
+	@Status NVARCHAR(20) = NULL
 AS
-declare @sql nvarchar(max) = N'/*CatchMe*/' 
-set @sql = @sql + 'SELECT *'+CHAR(13)+CHAR(10)
-set @sql = @sql + 'FROM sales.SalesOrderDetail sod '+CHAR(13)+CHAR(10)
-if @id IS NOT NULL
-	set @sql = @sql + 'WHERE'+CHAR(13)+CHAR(10)
-if @id IS NOT NULL
-	set @sql = @sql + '@id = sod.ProductID'+CHAR(13)+CHAR(10)
-set @sql = @sql + 'order by sod.ProductID'+CHAR(13)+CHAR(10)
-exec sp_executesql @sql, N'@id int', @id 
+										--#[ DemoSearchOrders
+SELECT o.OrderID, o.CustomerID, o.OrderDate, o.Status, o.TotalAmount
+FROM dbo.Orders o
+WHERE                                   --#if @CustomerID IS NOT NULL OR @Status IS NOT NULL
+(                                       --#-
+@CustomerID IS NULL OR                  --#-
+o.CustomerID = @CustomerID              --#if @CustomerID IS NOT NULL
+)                                       --#-
+AND                                     --#if @CustomerID IS NOT NULL AND @Status IS NOT NULL
+(                                       --#-
+@Status IS NULL OR                      --#-
+o.Status = @Status                      --#if @Status IS NOT NULL
+)                                       --#-
+ORDER BY o.OrderDate DESC               --#c
+										--#]
 GO
 
-EXEC [tlift_demo_very_simple_dynamic_version] @id = 897		-- 2 rows
-EXEC [tlift_demo_very_simple_dynamic_version]				-- 121.317 rows
-
--- Lets start over again. 
-EXEC sp_recompile 'tlift_demo_very_simple_dynamic_version';
-
-EXEC [tlift_demo_very_simple_dynamic_version]				-- 121.317 rows
-EXEC [tlift_demo_very_simple_dynamic_version] @id = 897		-- 2 rows
-
--- Show me the plan(s)
-SELECT cplan.usecounts, cplan.objtype, qtext.text, qplan.query_plan
-FROM sys.dm_exec_cached_plans AS cplan
-CROSS APPLY sys.dm_exec_sql_text(plan_handle) AS qtext
-CROSS APPLY sys.dm_exec_query_plan(plan_handle) AS qplan
-WHERE qtext.text LIKE '%/*CatchMe*/%' AND qtext.text NOT LIKE '%SELECT cplan.usecounts%' AND objtype = 'Prepared'
-ORDER BY cplan.usecounts DESC;
+PRINT 'Source procedure — still valid plain T-SQL';
+EXEC dbo.tlift_demo_search_orders @CustomerID = 1;
+EXEC dbo.tlift_demo_search_orders @Status = N'Shipped';
+EXEC dbo.tlift_demo_search_orders;
 GO
 
-CREATE OR ALTER PROCEDURE demo_very_simple42_but
-@id INT = NULL
-AS
-IF @id IS NULL
+DECLARE @dynsql NVARCHAR(MAX);
+
+EXEC [TLift_Engine].dbo.sp_tlift
+	@DatabaseName = 'TLift_TestDB',
+	@SchemaName = 'dbo',
+	@ProcedureName = 'tlift_demo_search_orders',
+	@ProcedureNameNew = 'tlift_demo_search_orders_rendered',
+	@Result = @dynsql OUTPUT;
+
+SELECT @dynsql AS RenderedProcedure;
+
+DECLARE @batch NVARCHAR(MAX) = N'';
+DECLARE @line NVARCHAR(MAX);
+DECLARE @cursorPos INT = 1;
+DECLARE @lineEnd INT;
+DECLARE @trimmedLine NVARCHAR(MAX);
+DECLARE @inSingleQuote BIT = 0;
+DECLARE @inBlockComment BIT = 0;
+DECLARE @scanPos INT;
+DECLARE @scanLen INT;
+DECLARE @ch NCHAR(1);
+DECLARE @nextCh NCHAR(1);
+
+WHILE @cursorPos <= LEN(@dynsql)
 BEGIN
-	SELECT *
-	FROM sales.SalesOrderDetail sod 
-	ORDER BY sod.ProductID
+	SET @lineEnd = CHARINDEX(CHAR(10), @dynsql, @cursorPos);
+	IF @lineEnd = 0
+	BEGIN
+		SET @line = SUBSTRING(@dynsql, @cursorPos, LEN(@dynsql) - @cursorPos + 1);
+		SET @cursorPos = LEN(@dynsql) + 1;
+	END
+	ELSE
+	BEGIN
+		SET @line = SUBSTRING(@dynsql, @cursorPos, @lineEnd - @cursorPos + 1);
+		SET @cursorPos = @lineEnd + 1;
+	END
+
+	SET @trimmedLine = LTRIM(RTRIM(REPLACE(REPLACE(@line, CHAR(13), ''), CHAR(10), '')));
+
+	IF @inSingleQuote = 0 AND @inBlockComment = 0 AND UPPER(@trimmedLine) = 'GO'
+	BEGIN
+		IF LEN(LTRIM(RTRIM(@batch))) > 0
+		BEGIN
+			SET @batch = REPLACE(@batch, 'create   procedure', 'CREATE OR ALTER PROCEDURE');
+			SET @batch = REPLACE(@batch, 'create  procedure',  'CREATE OR ALTER PROCEDURE');
+			SET @batch = REPLACE(@batch, 'create procedure',   'CREATE OR ALTER PROCEDURE');
+			SET @batch = REPLACE(@batch, 'CREATE  PROCEDURE',  'CREATE OR ALTER PROCEDURE');
+			SET @batch = REPLACE(@batch, 'CREATE   PROCEDURE', 'CREATE OR ALTER PROCEDURE');
+			SET @batch = REPLACE(@batch, 'CREATE OR ALTER OR ALTER', 'CREATE OR ALTER');
+			EXEC sp_executesql @batch;
+			SET @batch = N'';
+		END
+	END
+	ELSE
+	BEGIN
+		SET @batch = @batch + @line;
+
+		SET @scanPos = 1;
+		SET @scanLen = LEN(@line);
+
+		WHILE @scanPos <= @scanLen
+		BEGIN
+			SET @ch = SUBSTRING(@line, @scanPos, 1);
+			SET @nextCh = SUBSTRING(@line, @scanPos + 1, 1);
+
+			IF @inSingleQuote = 1
+			BEGIN
+				IF @ch = ''''
+				BEGIN
+					IF @nextCh = ''''
+						SET @scanPos = @scanPos + 2;
+					ELSE
+					BEGIN
+						SET @inSingleQuote = 0;
+						SET @scanPos = @scanPos + 1;
+					END
+				END
+				ELSE
+					SET @scanPos = @scanPos + 1;
+			END
+			ELSE IF @inBlockComment = 1
+			BEGIN
+				IF @ch = '*' AND @nextCh = '/'
+				BEGIN
+					SET @inBlockComment = 0;
+					SET @scanPos = @scanPos + 2;
+				END
+				ELSE
+					SET @scanPos = @scanPos + 1;
+			END
+			ELSE IF @ch = '-' AND @nextCh = '-'
+				BREAK;
+			ELSE IF @ch = '/' AND @nextCh = '*'
+			BEGIN
+				SET @inBlockComment = 1;
+				SET @scanPos = @scanPos + 2;
+			END
+			ELSE IF @ch = ''''
+			BEGIN
+				SET @inSingleQuote = 1;
+				SET @scanPos = @scanPos + 1;
+			END
+			ELSE
+				SET @scanPos = @scanPos + 1;
+		END
+	END
 END
-ELSE
+
+IF LEN(LTRIM(RTRIM(@batch))) > 0
 BEGIN
-	SELECT *
-	FROM sales.SalesOrderDetail sod 
-	WHERE @id = sod.ProductID
-	ORDER BY sod.ProductID
+	SET @batch = REPLACE(@batch, 'create   procedure', 'CREATE OR ALTER PROCEDURE');
+	SET @batch = REPLACE(@batch, 'create  procedure',  'CREATE OR ALTER PROCEDURE');
+	SET @batch = REPLACE(@batch, 'create procedure',   'CREATE OR ALTER PROCEDURE');
+	SET @batch = REPLACE(@batch, 'CREATE  PROCEDURE',  'CREATE OR ALTER PROCEDURE');
+	SET @batch = REPLACE(@batch, 'CREATE   PROCEDURE', 'CREATE OR ALTER PROCEDURE');
+	SET @batch = REPLACE(@batch, 'CREATE OR ALTER OR ALTER', 'CREATE OR ALTER');
+	EXEC sp_executesql @batch;
 END
 GO
 
-EXEC [demo_very_simple42_but] @id = 897		-- 2 rows
-EXEC [demo_very_simple42_but] @id = 870		-- 4688 rows
-EXEC [demo_very_simple42_but]				-- 121.317 rows
-
--- Lets start over again. 
-EXEC sp_recompile 'demo_very_simple42_but';
-
-EXEC [demo_very_simple42_but]				-- 121.317 rows
-EXEC [demo_very_simple42_but] @id = 897		-- 2 rows
-
-
-
-CREATE or ALTER Procedure [dbo].[tlift_demo_very_simple]
-@id int = NULL
-as
-								--#[ CatchMe2
-select *
-from sales.SalesOrderDetail sod 
-where								--#if @id is not null
-@id is null or						--#-
-sod.ProductID = @id					--#if @id is not null
-order by sod.ProductID
-								--#]
+PRINT 'Rendered procedure — now backed by dynamic SQL';
+EXEC dbo.tlift_demo_search_orders_rendered @CustomerID = 1;
+EXEC dbo.tlift_demo_search_orders_rendered @Status = N'Shipped';
+EXEC dbo.tlift_demo_search_orders_rendered;
 GO
 
-EXEC [tlift_demo_very_simple] @id = 897		-- 2 rows
-EXEC [tlift_demo_very_simple]				-- 121.317 rows
-
-SET STATISTICS IO OFF; -- Verbose...
-
-declare @dynsql nvarchar(max)
-
-exec [SX Playground V3]..[sp_tlift] @DatabaseName =  'AdventureWorks2016_EXT'
-,@ProcedureName ='tlift_demo_very_simple'
-,@result = @dynsql output
-
-print @dynsql
-GO
-
--- Grap this name here -> [tlift_demo_very_simple_after]
-
-CREATE  OR ALTER  Procedure [dbo].[tlift_demo_very_simple_after]
-@id int = NULL
-as
-declare @sql nvarchar(max) = N'' 
-set @sql = @sql + 'select *'+CHAR(13)+CHAR(10)
-set @sql = @sql + 'from sales.SalesOrderDetail sod '+CHAR(13)+CHAR(10)
-if @id is not null
-set @sql = @sql + 'where								'+CHAR(13)+CHAR(10)
---@id is null or						
-if @id is not null
-set @sql = @sql + 'sod.ProductID = @id					'+CHAR(13)+CHAR(10)
-set @sql = @sql + 'order by sod.ProductID'+CHAR(13)+CHAR(10)
-set @sql = '/*CatchMe2*/' + @sql
-exec sp_executesql @sql, N'@id int', @id 
-
-
-SET STATISTICS IO ON; -- Back on...
-EXEC [tlift_demo_very_simple_after] @id = 897		-- 2 rows
-EXEC [tlift_demo_very_simple_after]				-- 121.317 rows
-
--- Lets start over again. 
-EXEC sp_recompile 'tlift_demo_very_simple_after';
-
-EXEC [tlift_demo_very_simple_after]				-- 121.317 rows
-EXEC [tlift_demo_very_simple_after] @id = 897		-- 2 rows
-
-
--- Show me the plan(s)
-SELECT cplan.usecounts, cplan.objtype, qtext.text, qplan.query_plan
+SELECT cplan.usecounts, qtext.text, qplan.query_plan
 FROM sys.dm_exec_cached_plans AS cplan
 CROSS APPLY sys.dm_exec_sql_text(plan_handle) AS qtext
 CROSS APPLY sys.dm_exec_query_plan(plan_handle) AS qplan
-WHERE qtext.text LIKE '%/*CatchMe2*/%' AND qtext.text NOT LIKE '%SELECT cplan.usecounts%' AND objtype = 'Prepared'
-ORDER BY cplan.usecounts DESC;
-GO
-
-create or alter procedure [dbo].[tlift_demo_very_simple3] 
-@id int = null,
-@orderQty int = null
-AS
-SELECT *
-FROM sales.SalesOrderDetail sod 
-WHERE (@id IS NULL or @id = sod.ProductID) AND (@orderQty IS NULL OR sod.OrderQty >= @orderQty) -- and so on
-GO
-
-exec tlift_demo_very_simple3 @id= 897
-exec tlift_demo_very_simple3 @id = 866
-exec tlift_demo_very_simple3
-exec tlift_demo_very_simple3 @orderQty = 4
-exec tlift_demo_very_simple3 @orderQty = 4, @id = 866
--- Lets start over again. 
-EXEC sp_recompile 'tlift_demo_very_simple3';
-
-go
-
-create or alter procedure [dbo].[tlift_demo_very_simple3] 
-@id int = null,
-@orderQty int = null
-AS
-							--#[ CatchMe3
-SELECT *
-FROM sales.SalesOrderDetail sod 
-WHERE								--#if @id IS NOT NULL OR @orderQty IS NOT NULL
-(@id IS NULL or						--#-
-@id = sod.ProductID					--#if @id IS NOT NULL
-)									--#-
-and									--#if @id IS NOT NULL AND @orderQty IS NOT NULL
-(@orderQty IS NULL OR				--#-
-sod.OrderQty >= @orderQty			--#if @orderQty IS NOT NULL
-)									--#-
-							--#]
-go
-
-SET STATISTICS IO OFF; -- Verbose...
-
-declare @dynsql nvarchar(max)
-
-exec [SX Playground V3]..[sp_tlift] @DatabaseName =  'AdventureWorks2016_EXT'
-,@ProcedureName ='tlift_demo_very_simple3'
-,@result = @dynsql output
-
-print @dynsql
-GO
-
--- Grap this name here -> [tlift_demo_very_simple3_after]
-
-create   procedure [dbo].[tlift_demo_very_simple3_after] 
-@id int = null,
-@orderQty int = null
-AS
-declare @sql nvarchar(max) = N'' 
-set @sql = @sql + 'SELECT *'+CHAR(13)+CHAR(10)
-set @sql = @sql + 'FROM sales.SalesOrderDetail sod '+CHAR(13)+CHAR(10)
-if @id IS NOT NULL OR @orderQty IS NOT NULL
-set @sql = @sql + 'WHERE								'+CHAR(13)+CHAR(10)
---(@id IS NULL or						
-if @id IS NOT NULL
-set @sql = @sql + '@id = sod.ProductID					'+CHAR(13)+CHAR(10)
---)									
-if @id IS NOT NULL AND @orderQty IS NOT NULL
-set @sql = @sql + 'and									'+CHAR(13)+CHAR(10)
---(@orderQty IS NULL OR				
-if @orderQty IS NOT NULL
-set @sql = @sql + 'sod.OrderQty >= @orderQty			'+CHAR(13)+CHAR(10)
---)									
-set @sql = '/*CatchMe3*/' + @sql
-exec sp_executesql @sql, N'@id int, @orderQty int', @id , @orderQty 
-
-
-exec tlift_demo_very_simple3_after @id= 897
-exec tlift_demo_very_simple3_after @id = 866
-exec tlift_demo_very_simple3_after
-exec tlift_demo_very_simple3_after @orderQty = 4
-exec tlift_demo_very_simple3_after @orderQty = 4, @id = 866
--- Lets start over again. 
-EXEC sp_recompile 'tlift_demo_very_simple3_after';
-
--- Show me the plan(s)
-SELECT cplan.usecounts, cplan.objtype, qtext.text, qplan.query_plan
-FROM sys.dm_exec_cached_plans AS cplan
-CROSS APPLY sys.dm_exec_sql_text(plan_handle) AS qtext
-CROSS APPLY sys.dm_exec_query_plan(plan_handle) AS qplan
-WHERE qtext.text LIKE '%/*CatchMe3*/%' AND qtext.text NOT LIKE '%SELECT cplan.usecounts%' AND objtype = 'Prepared'
+WHERE qtext.text LIKE '%/*DemoSearchOrders*/%'
+  AND qtext.text NOT LIKE '%dm_exec_cached_plans%'
 ORDER BY cplan.usecounts DESC;
 GO
