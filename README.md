@@ -1,6 +1,6 @@
 # T-Lift
 
-A T-SQL precompiler that transforms stored procedures into dynamic T-SQL — so SQL Server can build better query plans without you having to write dynamic SQL by hand.
+T-Lift is a T-SQL precompiler that lets developers use directive-based meta-code within stored procedures to generate controlled, dynamic T-SQL. It is designed for teams that understand when and why dynamic SQL helps SQL Server build more *predictable* execution plans, but want a cleaner, safer, and more comfortable way to apply it without hand-crafting dynamic SQL everywhere.
 
 Written entirely in T-SQL. Ships as a single stored procedure (`sp_tlift`).
 
@@ -8,7 +8,7 @@ Written entirely in T-SQL. Ships as a single stored procedure (`sp_tlift`).
 
 ## Table of Contents
 
-- [The Problem](#the-problem)
+- [The Idea](#The-Idea-in-a-Nutshell-aka-'Hello-World!')
 - [What T-Lift Does](#what-t-lift-does)
 - [Installation](#installation)
 - [Basic Usage](#basic-usage)
@@ -35,9 +35,9 @@ Written entirely in T-SQL. Ships as a single stored procedure (`sp_tlift`).
 
 ---
 
-## The Problem
+## The Idea in a Nutshell aka 'Hello World!'
 
-Consider this common pattern in SQL Server stored procedures:
+Consider to get an idea how T-Lift works this common pattern in SQL Server stored procedures:
 
 ```sql
 CREATE OR ALTER PROCEDURE dbo.SearchOrders
