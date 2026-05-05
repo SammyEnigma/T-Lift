@@ -8,7 +8,7 @@ Written entirely in T-SQL. Ships as a single stored procedure (`sp_tlift`).
 
 ## Table of Contents
 
-- [The Idea](#The-Idea-in-a-Nutshell-aka-'Hello-World!')
+- [The Idea](#the-idea-in-a-nutshell-aka-hello-world)
 - [What T-Lift Does](#what-t-lift-does)
 - [Installation](#installation)
 - [Basic Usage](#basic-usage)
