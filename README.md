@@ -725,6 +725,7 @@ Feedback and contributions via GitHub issues are welcome.
 
 ## Version Log
 
+- **1.02** - Fixed output parameter propagation from generated `sp_executesql` calls, directive scanning for `--#` tokens inside multiline string literals, and unknown directive validation so typos now fail instead of warning.
 - **1.01** — Named conditions (`--#define`), block removal (`--#{-` / `--#-}`), `--#{if` blocks inside dynamic SQL sections (empty line guard fix), improved condition handling in `--#if` / `--#{if` / `--#{elseif` with named condition resolution, unused condition warnings, removal block bracket validation
 - **1.00** — Else / else-if directives (`--#else`, `--#{elseif`), validation mode (`@validateOnly`), wrapper procedure generation (`--#wrapper`, `--#branch`), recompile hint (`--#recompile`), comment-out directive (`--#c`), bucket-based plan cache segmentation (`--#buckets`), unknown directive detection, bracket matching validation, TRY/CATCH error handling, safe procedure rename, SQL 2022+ ordinal support
 - **0.46** — Replaced `sp_helptext` with `sys.sql_modules` for procedure text retrieval. Added support for output parameters.

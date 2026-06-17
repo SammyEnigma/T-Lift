@@ -25,7 +25,7 @@ DECLARE @ExecutionTime INT;
 
 SET @StartTime = SYSUTCDATETIME();
 
-DECLARE @Version CHAR(5) = '01.01'
+DECLARE @Version CHAR(5) = '01.02'
 
 PRINT ''
 PRINT 'Welcome to T-Lift Version '+ @Version
@@ -248,10 +248,11 @@ PRINT 'Looking for directives'
 
 DECLARE @directiveScanLineNumber INT;
 DECLARE @directiveScanText NVARCHAR(MAX);
-DECLARE @directiveScanStartPos INT;
-DECLARE @directiveScanQuotePos INT;
+DECLARE @directiveScanCurrentPos INT;
 DECLARE @directiveScanTextLength INT;
-DECLARE @nextDirectivePos INT;
+DECLARE @directiveScanInSingleQuote BIT = 0;
+DECLARE @directiveScanChar NCHAR(1);
+DECLARE @directiveScanNextChar NCHAR(1);
 DECLARE @directivePos INT;
 
 SELECT @directiveScanLineNumber = MIN(LineNumber)
@@ -264,40 +265,51 @@ BEGIN
 	WHERE LineNumber = @directiveScanLineNumber;
 
 	SET @directivePos = NULL;
-	SET @directiveScanStartPos = 1;
-	SET @directiveScanTextLength = LEN(@directiveScanText);
+	SET @directiveScanCurrentPos = 1;
+	SET @directiveScanTextLength = DATALENGTH(@directiveScanText) / 2;
 
 	-- Only treat --# markers outside quoted string literals as directives.
-	WHILE @directiveScanStartPos <= @directiveScanTextLength
+	-- Keep quote state across lines so multiline string literals are not parsed as directives.
+	WHILE @directiveScanCurrentPos <= @directiveScanTextLength
 	BEGIN
-		SET @nextDirectivePos = CHARINDEX('--#', @directiveScanText, @directiveScanStartPos);
-		IF @nextDirectivePos = 0
-			BREAK;
+		SET @directiveScanChar = SUBSTRING(@directiveScanText, @directiveScanCurrentPos, 1);
+		SET @directiveScanNextChar = CASE 
+				WHEN @directiveScanCurrentPos < @directiveScanTextLength
+					THEN SUBSTRING(@directiveScanText, @directiveScanCurrentPos + 1, 1)
+				ELSE N''
+				END;
 
-		SET @directiveScanQuotePos = CHARINDEX('''', @directiveScanText, @directiveScanStartPos);
-		IF @directiveScanQuotePos = 0 OR @nextDirectivePos < @directiveScanQuotePos
+		IF @directiveScanInSingleQuote = 1
 		BEGIN
-			SET @directivePos = @nextDirectivePos;
-			BREAK;
-		END
-
-		SET @directiveScanStartPos = @directiveScanQuotePos + 1;
-		WHILE @directiveScanStartPos <= @directiveScanTextLength
-		BEGIN
-			SET @directiveScanQuotePos = CHARINDEX('''', @directiveScanText, @directiveScanStartPos);
-			IF @directiveScanQuotePos = 0
+			IF @directiveScanChar = ''''
 			BEGIN
-				SET @directiveScanStartPos = @directiveScanTextLength + 1;
-				BREAK;
+				IF @directiveScanNextChar = ''''
+					SET @directiveScanCurrentPos = @directiveScanCurrentPos + 2;
+				ELSE
+				BEGIN
+					SET @directiveScanInSingleQuote = 0;
+					SET @directiveScanCurrentPos = @directiveScanCurrentPos + 1;
+				END
 			END
-
-			IF SUBSTRING(@directiveScanText, @directiveScanQuotePos + 1, 1) = ''''
-				SET @directiveScanStartPos = @directiveScanQuotePos + 2;
 			ELSE
+				SET @directiveScanCurrentPos = @directiveScanCurrentPos + 1;
+		END
+		ELSE
+		BEGIN
+			IF @directiveScanChar = ''''
 			BEGIN
-				SET @directiveScanStartPos = @directiveScanQuotePos + 1;
+				SET @directiveScanInSingleQuote = 1;
+				SET @directiveScanCurrentPos = @directiveScanCurrentPos + 1;
+			END
+			ELSE IF @directiveScanChar = '-' 
+				AND @directiveScanNextChar = '-'
+				AND SUBSTRING(@directiveScanText, @directiveScanCurrentPos, 3) = '--#'
+			BEGIN
+				SET @directivePos = @directiveScanCurrentPos;
 				BREAK;
 			END
+			ELSE
+				SET @directiveScanCurrentPos = @directiveScanCurrentPos + 1;
 		END
 	END
 
@@ -447,7 +459,9 @@ WHERE Comment IS NOT NULL
 
 IF @unknownDirectives IS NOT NULL
 BEGIN
-	PRINT 'WARNING: Unknown directive(s) found: ' + @unknownDirectives;
+	DECLARE @unknownDirectiveErr NVARCHAR(MAX) = N'Unknown T-Lift directive(s) found: ' + @unknownDirectives;
+	RAISERROR(@unknownDirectiveErr, 16, 1);
+	RETURN;
 END
 
 -- ===================================================================
@@ -598,7 +612,11 @@ SELECT @Parameters = STRING_AGG(ParameterName + ' ' + DataType + CASE
 				THEN ' OUTPUT'
 			ELSE ''
 			END, ', ')
-	,@Parameters2 = STRING_AGG(ParameterName + ' ', ', ')
+	,@Parameters2 = STRING_AGG(ParameterName + CASE 
+			WHEN IsOutput = 1
+				THEN ' OUTPUT'
+			ELSE ''
+			END, ', ')
 FROM #parameters;
 
 PRINT 'Got procedures parameters'
